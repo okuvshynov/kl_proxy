@@ -66,15 +66,37 @@ curl http://localhost:8080/v1/chat/completions \
 The proxy will:
 1. Add `"n_probs": 10` (or your configured value) to the request
 2. Forward to the main model and get the full response
-3. Send a limited request (with `candidate_max_tokens`) to the candidate model
-4. Compare tokens and log logprobs only for matching tokens
+3. Send multiple requests to the candidate model to cover the entire main response:
+   - First request: limited by `candidate_max_tokens`
+   - If divergence occurs, subsequent requests include partial assistant response
+   - Continues until entire main response is covered
+4. Compare tokens and log logprobs for all matching segments
 
 ## Logprobs Output
 
 When tokens match between the main and candidate models, the proxy logs:
-- Token-by-token comparison showing matching tokens
+- Summary of total tokens matched across all requests
+- Breakdown by request showing token ranges
 - Top N logprobs for each matching token (formatted to 3 decimal places)
 - Separate sections for main model and candidate model outputs
+
+Example with multiple requests:
+```
+================================================================================
+KL DIVERGENCE COMPARISON: 15/20 tokens matched across 3 requests
+================================================================================
+
+Request 1 - Tokens 1-5:
+Main model:
+  'The' : [(785, 'The', '-0.123'), ...]
+  ' answer' : [(220, ' ', '-0.001'), ...]
+  ...
+
+Request 2 - Tokens 8-12:
+Main model:
+  ' is' : [(374, ' is', '-0.045'), ...]
+  ...
+```
 
 ## Next Steps
 
