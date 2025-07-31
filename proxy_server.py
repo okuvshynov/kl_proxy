@@ -20,8 +20,10 @@ class ProxyServer:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.target_host = config['target_host']
+        self.candidate_host = config.get('candidate_host', 'http://localhost:8081')
         self.n_probs = config.get('n_probs', 10)
         self.port = config.get('port', 8080)
+        self.candidate_max_tokens = config.get('candidate_max_tokens', 8)
         
     async def handle_chat_completions(self, request: web.Request) -> web.Response:
         """Handle /v1/chat/completions endpoint with n_probs injection"""
@@ -38,28 +40,49 @@ class ProxyServer:
                       if k.lower() not in ['host', 'content-length']}
             
             async with aiohttp.ClientSession() as session:
-                url = f"{self.target_host}{request.path_qs}"
+                # First, get response from main model
+                main_url = f"{self.target_host}{request.path_qs}"
                 
                 async with session.post(
-                    url,
+                    main_url,
                     json=body,
                     headers=headers
-                ) as response:
-                    # Read and parse the response
-                    response_body = await response.read()
+                ) as main_response:
+                    main_body = await main_response.read()
+                    main_status = main_response.status
+                    main_headers = main_response.headers
                     
-                    # Try to parse and log logprobs if present
+                    # Try to parse main response and send to candidate
                     try:
-                        response_json = json.loads(response_body)
-                        self._log_logprobs(response_json)
-                    except (json.JSONDecodeError, KeyError):
-                        # If parsing fails, just pass through
-                        pass
+                        main_json = json.loads(main_body)
+                        
+                        # Prepare candidate request with limited tokens
+                        candidate_body = body.copy()
+                        candidate_body['max_tokens'] = self.candidate_max_tokens
+                        
+                        # Send request to candidate model
+                        candidate_url = f"{self.candidate_host}{request.path_qs}"
+                        async with session.post(
+                            candidate_url,
+                            json=candidate_body,
+                            headers=headers
+                        ) as candidate_response:
+                            candidate_body_response = await candidate_response.read()
+                            
+                            try:
+                                candidate_json = json.loads(candidate_body_response)
+                                self._compare_and_log_logprobs(main_json, candidate_json)
+                            except (json.JSONDecodeError, KeyError) as e:
+                                logger.error(f"Error parsing candidate response: {e}")
+                                
+                    except (json.JSONDecodeError, KeyError) as e:
+                        logger.error(f"Error parsing main response: {e}")
                     
+                    # Return the main model's response
                     return web.Response(
-                        body=response_body,
-                        status=response.status,
-                        headers=response.headers
+                        body=main_body,
+                        status=main_status,
+                        headers=main_headers
                     )
                     
         except Exception as e:
@@ -70,39 +93,80 @@ class ProxyServer:
                 content_type='application/json'
             )
     
-    def _log_logprobs(self, response_json: Dict[str, Any]) -> None:
-        """Parse and log logprobs from the response"""
+    def _compare_and_log_logprobs(self, main_json: Dict[str, Any], candidate_json: Dict[str, Any]) -> None:
+        """Compare tokens from main and candidate models, log matching tokens' logprobs"""
         try:
-            for choice in response_json.get('choices', []):
+            # Extract tokens from both responses
+            main_tokens = []
+            main_logprobs = []
+            for choice in main_json.get('choices', []):
                 logprobs = choice.get('logprobs', {})
                 content_logprobs = logprobs.get('content', [])
+                for token_data in content_logprobs:
+                    main_tokens.append(token_data.get('token', ''))
+                    main_logprobs.append(token_data)
+            
+            candidate_tokens = []
+            candidate_logprobs = []
+            for choice in candidate_json.get('choices', []):
+                logprobs = choice.get('logprobs', {})
+                content_logprobs = logprobs.get('content', [])
+                for token_data in content_logprobs:
+                    candidate_tokens.append(token_data.get('token', ''))
+                    candidate_logprobs.append(token_data)
+            
+            # Find the number of matching tokens
+            matching_count = 0
+            for i in range(min(len(main_tokens), len(candidate_tokens))):
+                if main_tokens[i] == candidate_tokens[i]:
+                    matching_count += 1
+                else:
+                    break
+            
+            # Log only if there are matching tokens
+            if matching_count > 0:
+                logger.info("\n" + "="*80)
+                logger.info(f"KL DIVERGENCE COMPARISON: {matching_count} matching tokens")
+                logger.info("="*80)
                 
-                if content_logprobs:
-                    logger.info("\n" + "="*80)
-                    logger.info("LOGPROBS OUTPUT:")
-                    logger.info("="*80)
+                # Log main model tokens
+                logger.info("Main model:")
+                for i in range(matching_count):
+                    token_data = main_logprobs[i]
+                    selected_token = token_data.get('token', '')
                     
-                    for token_data in content_logprobs:
-                        selected_token = token_data.get('token', '')
-                        selected_id = token_data.get('id', -1)
-                        selected_logprob = token_data.get('logprob', 0.0)
-                        
-                        # Format top logprobs as list of tuples
-                        candidates = []
-                        for candidate in token_data.get('top_logprobs', [])[:self.n_probs]:
-                            candidates.append((
-                                candidate.get('id', -1),
-                                repr(candidate.get('token', '')),  # Use repr to show escape sequences
-                                candidate.get('logprob', 0.0)
-                            ))
-                        
-                        # Log in the requested format
-                        logger.info(f"{repr(selected_token)} : {candidates}")
+                    # Format top logprobs with 3 decimal points
+                    candidates = []
+                    for candidate in token_data.get('top_logprobs', [])[:self.n_probs]:
+                        candidates.append((
+                            candidate.get('id', -1),
+                            repr(candidate.get('token', '')),
+                            f"{candidate.get('logprob', 0.0):.3f}"
+                        ))
                     
-                    logger.info("="*80 + "\n")
+                    logger.info(f"  {repr(selected_token)} : {candidates}")
+                
+                # Log candidate model tokens
+                logger.info("\nCandidate model:")
+                for i in range(matching_count):
+                    token_data = candidate_logprobs[i]
+                    selected_token = token_data.get('token', '')
                     
+                    # Format top logprobs with 3 decimal points
+                    candidates = []
+                    for candidate in token_data.get('top_logprobs', [])[:self.n_probs]:
+                        candidates.append((
+                            candidate.get('id', -1),
+                            repr(candidate.get('token', '')),
+                            f"{candidate.get('logprob', 0.0):.3f}"
+                        ))
+                    
+                    logger.info(f"  {repr(selected_token)} : {candidates}")
+                
+                logger.info("="*80 + "\n")
+                
         except Exception as e:
-            logger.error(f"Error parsing logprobs: {e}")
+            logger.error(f"Error comparing logprobs: {e}")
     
     async def handle_generic_request(self, request: web.Request) -> web.Response:
         """Handle all other requests by forwarding them unchanged"""
@@ -162,8 +226,9 @@ class ProxyServer:
         await site.start()
         
         logger.info(f"Proxy server started on port {self.port}")
-        logger.info(f"Forwarding requests to {self.target_host}")
-        logger.info(f"n_probs parameter set to {self.n_probs}")
+        logger.info(f"Main model: {self.target_host}")
+        logger.info(f"Candidate model: {self.candidate_host}")
+        logger.info(f"n_probs: {self.n_probs}, candidate_max_tokens: {self.candidate_max_tokens}")
         
         # Keep the server running
         await asyncio.Event().wait()

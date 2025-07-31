@@ -7,8 +7,9 @@ A proxy server for measuring KL divergence between two LLM models in real-time.
 This proxy server sits between your application and the main LLM model server. It:
 - Forwards all HTTP requests to the target model server
 - For `/v1/chat/completions` endpoints, automatically adds an `n_probs` parameter to request logit values
-- (Future) Asynchronously sends queries to a quantized model for comparison
-- (Future) Calculates KL divergence between the two models' outputs
+- Sends queries to a candidate model for comparison (with limited max_tokens)
+- Compares token outputs and logs logprobs only for matching tokens
+- Helps identify where model outputs diverge
 
 ## Installation
 
@@ -20,8 +21,10 @@ pip install -r requirements.txt
 
 Edit `config.yaml` to set:
 - `target_host`: The URL of your main model server
+- `candidate_host`: The URL of your candidate model server (default: http://localhost:8081)
 - `n_probs`: Number of top logits to request (default: 10)
-- `port`: Port for the proxy to listen on (default: 8080)
+- `port`: Port for the proxy to listen on (default: 8088)
+- `candidate_max_tokens`: Max tokens for candidate model queries (default: 8)
 
 ## Usage
 
@@ -60,11 +63,22 @@ curl http://localhost:8080/v1/chat/completions \
 }'
 ```
 
-The proxy will automatically add `"n_probs": 10` (or your configured value) to the request before forwarding it.
+The proxy will:
+1. Add `"n_probs": 10` (or your configured value) to the request
+2. Forward to the main model and get the full response
+3. Send a limited request (with `candidate_max_tokens`) to the candidate model
+4. Compare tokens and log logprobs only for matching tokens
+
+## Logprobs Output
+
+When tokens match between the main and candidate models, the proxy logs:
+- Token-by-token comparison showing matching tokens
+- Top N logprobs for each matching token (formatted to 3 decimal places)
+- Separate sections for main model and candidate model outputs
 
 ## Next Steps
 
-- Add async forwarding to quantized model server
-- Implement logit extraction and comparison
-- Calculate and report KL divergence metrics
-- Add monitoring and visualization
+- Calculate actual KL divergence metrics between matching tokens
+- Support multiple candidate queries to check full responses
+- Add monitoring and visualization dashboard
+- Export metrics for analysis

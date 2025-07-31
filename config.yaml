@@ -1,8 +1,14 @@
 # Target host to forward requests to
 target_host: http://localhost:8080
 
+# Candidate model endpoint for comparison
+candidate_host: http://localhost:8081
+
 # Number of top logits to request
 n_probs: 10
 
 # Port for the proxy server to listen on
 port: 8088
+
+# Max tokens for candidate model (to save compute)
+candidate_max_tokens: 8
