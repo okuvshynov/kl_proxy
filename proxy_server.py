@@ -45,8 +45,16 @@ class ProxyServer:
                     json=body,
                     headers=headers
                 ) as response:
-                    # Stream the response back
+                    # Read and parse the response
                     response_body = await response.read()
+                    
+                    # Try to parse and log logprobs if present
+                    try:
+                        response_json = json.loads(response_body)
+                        self._log_logprobs(response_json)
+                    except (json.JSONDecodeError, KeyError):
+                        # If parsing fails, just pass through
+                        pass
                     
                     return web.Response(
                         body=response_body,
@@ -61,6 +69,40 @@ class ProxyServer:
                 status=500,
                 content_type='application/json'
             )
+    
+    def _log_logprobs(self, response_json: Dict[str, Any]) -> None:
+        """Parse and log logprobs from the response"""
+        try:
+            for choice in response_json.get('choices', []):
+                logprobs = choice.get('logprobs', {})
+                content_logprobs = logprobs.get('content', [])
+                
+                if content_logprobs:
+                    logger.info("\n" + "="*80)
+                    logger.info("LOGPROBS OUTPUT:")
+                    logger.info("="*80)
+                    
+                    for token_data in content_logprobs:
+                        selected_token = token_data.get('token', '')
+                        selected_id = token_data.get('id', -1)
+                        selected_logprob = token_data.get('logprob', 0.0)
+                        
+                        # Format top logprobs as list of tuples
+                        candidates = []
+                        for candidate in token_data.get('top_logprobs', [])[:self.n_probs]:
+                            candidates.append((
+                                candidate.get('id', -1),
+                                repr(candidate.get('token', '')),  # Use repr to show escape sequences
+                                candidate.get('logprob', 0.0)
+                            ))
+                        
+                        # Log in the requested format
+                        logger.info(f"{repr(selected_token)} : {candidates}")
+                    
+                    logger.info("="*80 + "\n")
+                    
+        except Exception as e:
+            logger.error(f"Error parsing logprobs: {e}")
     
     async def handle_generic_request(self, request: web.Request) -> web.Response:
         """Handle all other requests by forwarding them unchanged"""
