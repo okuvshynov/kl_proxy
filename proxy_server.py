@@ -2,6 +2,9 @@ import asyncio
 import json
 import logging
 from typing import Dict, Any, Optional, List
+import csv
+from datetime import datetime
+import os
 
 import aiohttp
 from aiohttp import web
@@ -46,7 +49,9 @@ class ProxyServer:
         self.n_probs = config.get('n_probs', 10)
         self.port = config.get('port', 8080)
         self.candidate_max_tokens = config.get('candidate_max_tokens', 8)
-        self.kld_by_ctx_size = {}
+        self.kld_by_ctx_size = []
+        self.kld_output_file = config.get('kld_output_file', 'kl_divergence_stats.csv')
+        self.request_count = 0
         
     async def handle_chat_completions(self, request: web.Request) -> web.Response:
         """Handle /v1/chat/completions endpoint with n_probs injection"""
@@ -190,19 +195,29 @@ class ProxyServer:
                 logits_b = [lp['logprob'] for lp in candidate]
 
                 kld = kl_divergence_lower_bound(logits_a, logits_b, indices_a, indices_b)
-                if pos not in self.kld_by_ctx_size:
-                    self.kld_by_ctx_size[pos] = []
-                
-                self.kld_by_ctx_size[pos].append(kld)
-                #logger.info(f'kld @ {pos} -> {kld}')
-
-            for ctx_pos in sorted(self.kld_by_ctx_size.keys()):
-                logger.info(f'kld[{ctx_pos}] = {np.average(self.kld_by_ctx_size[ctx_pos])}')
-
+                self.kld_by_ctx_size.append((pos, kld))
+                logger.info(f'kld @ {pos} -> {kld}')
+            
+            # Save statistics after each request
+            self.request_count += 1
+            self.save_kld_statistics()
                 
         except Exception as e:
             logger.error(f"Error in iterative candidate comparison: {e}")
-
+    
+    def save_kld_statistics(self):
+        """Save KLD statistics to CSV file, overwriting existing file"""
+        try:
+            with open(self.kld_output_file, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['context_size', 'kl_divergence'])
+                
+                for pos, kld in self.kld_by_ctx_size:
+                    writer.writerow([pos, kld])
+                
+            logger.info(f"Saved {len(self.kld_by_ctx_size)} KLD measurements to {self.kld_output_file}")
+        except Exception as e:
+            logger.error(f"Error saving KLD statistics: {e}")
     
     async def handle_generic_request(self, request: web.Request) -> web.Response:
         """Handle all other requests by forwarding them unchanged"""
