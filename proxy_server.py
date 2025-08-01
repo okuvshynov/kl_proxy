@@ -7,6 +7,7 @@ import aiohttp
 from aiohttp import web
 import click
 import yaml
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -16,6 +17,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def kl_divergence_lower_bound(logits1_top1k, logits2_top1k, indices1, indices2):
+    # Find common indices
+    common_indices = np.intersect1d(indices1, indices2)
+    
+    # Create mappings
+    idx_map1 = {idx: i for i, idx in enumerate(indices1)}
+    idx_map2 = {idx: i for i, idx in enumerate(indices2)}
+    
+    # Get logits for common classes
+    common_logits1 = np.array([logits1_top1k[idx_map1[idx]] for idx in common_indices])
+    common_logits2 = np.array([logits2_top1k[idx_map2[idx]] for idx in common_indices])
+    
+    # Compute softmax over just these logits
+    probs1 = np.exp(common_logits1) / np.sum(np.exp(common_logits1))
+    probs2 = np.exp(common_logits2) / np.sum(np.exp(common_logits2))
+    
+    # Compute KL over common support
+    kl = np.sum(probs1 * np.log(probs1 / probs2))
+    
+    return kl
 
 class ProxyServer:
     def __init__(self, config: Dict[str, Any]):
@@ -25,6 +46,7 @@ class ProxyServer:
         self.n_probs = config.get('n_probs', 10)
         self.port = config.get('port', 8080)
         self.candidate_max_tokens = config.get('candidate_max_tokens', 8)
+        self.kld_by_ctx_size = {}
         
     async def handle_chat_completions(self, request: web.Request) -> web.Response:
         """Handle /v1/chat/completions endpoint with n_probs injection"""
@@ -148,7 +170,7 @@ class ProxyServer:
                             if start_pos + i < len(main_tokens):
                                 main_logprobs = main_json['choices'][0]['logprobs']['content'][start_pos + i]['top_logprobs']
                                 candidate_logprobs = candidate_json['choices'][0]['logprobs']['content'][i]['top_logprobs']
-                                
+
                                 all_comparisons.append((prompt_tokens + start_pos + i, main_logprobs, candidate_logprobs))
                                 
                                 covered_tokens.append(main_tokens[start_pos + i])
@@ -162,14 +184,25 @@ class ProxyServer:
                         break
                         
             for pos, main, candidate in all_comparisons:
-                logger.info(f'{pos}: {main} vs {candidate}')
+                indices_a = [lp['id'] for lp in main]
+                logits_a = [lp['logprob'] for lp in main]
+                indices_b = [lp['id'] for lp in candidate]
+                logits_b = [lp['logprob'] for lp in candidate]
+
+                kld = kl_divergence_lower_bound(logits_a, logits_b, indices_a, indices_b)
+                if pos not in self.kld_by_ctx_size:
+                    self.kld_by_ctx_size[pos] = []
+                
+                self.kld_by_ctx_size[pos].append(kld)
+                #logger.info(f'kld @ {pos} -> {kld}')
+
+            for ctx_pos in sorted(self.kld_by_ctx_size.keys()):
+                logger.info(f'kld[{ctx_pos}] = {np.average(self.kld_by_ctx_size[ctx_pos])}')
+
                 
         except Exception as e:
             logger.error(f"Error in iterative candidate comparison: {e}")
 
-
-
-    
     
     async def handle_generic_request(self, request: web.Request) -> web.Response:
         """Handle all other requests by forwarding them unchanged"""

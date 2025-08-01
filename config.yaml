@@ -5,7 +5,7 @@ target_host: http://localhost:8080
 candidate_host: http://localhost:8081
 
 # Number of top logits to request
-n_probs: 4
+n_probs: 5000
 
 # Port for the proxy server to listen on
 port: 8088
